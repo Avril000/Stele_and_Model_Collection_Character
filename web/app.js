@@ -64,6 +64,15 @@ function toggleBrush(ch, idx, book) {
 }
 function clearBrush() { brushSet = {}; }
 
+/* 这一句里标了多少个朱笔。只数当前碑的键——换了碑之后旧键还留在 brushSet 里
+   （换回去还能看见，这是有意的），但报数不能把它们算进去。 */
+function brushCount(book) {
+  var pre = (book || state.book) + ':';
+  var n = 0;
+  for (var k in brushSet) if (k.indexOf(pre) === 0) n++;
+  return n;
+}
+
 /* 朱笔的字染什么颜色：默认朱砂。
    ⚠️ 整幅已经是朱砂时反过来染成**墨色**——不然满纸皆红，看不出标了哪个；
    原碑模式（黑底）用亮一档的朱砂，暗朱砂在黑纸上看不见。 */
@@ -195,6 +204,7 @@ function resetPicks() {
   okCache = {};
   curPick = null;
   clearBrush();   // 朱笔标的是"这一句里的第几个字"，换了句子就跟着作废
+  clearUndo();    // 句子换了，撤销栈里那些"上一次的样子"也就不作数了（见 undoStack 上的说明）
 }
 
 // 记忆的键 = 碑 + 字 + 本句第几次出现
@@ -1554,9 +1564,11 @@ function renderHistory() {
         state.book = item.book;
       }
       state.layout = item.layout || '条幅';
+      var lost = brushCount(state.book);   // 清之前数，清完就永远是 0 了
       syncPanel();
       closeVersions();
       resetPicks();   // 从历史里换了一句话，等于换句子
+      if (lost) showToast('换了一句话：' + lost + ' 个朱笔标注已清空', [], { hold: 3600 });
       refreshInput();   // 恢复的句子可能很长，输入框高度和字数提示都要跟上
       render();
       toggleHistory(false);
@@ -1754,33 +1766,217 @@ function num(v, dflt) {
   return isFinite(v) ? v : dflt;
 }
 
-function cfgEqual(a, b) {
-  return a.book === b.book && a.layout === b.layout && a.ink === b.ink &&
-    !!a.credit === !!b.credit && !!a.seal === !!b.seal &&
-    !!a.ruled === !!b.ruled && a.ruleDir === b.ruleDir &&
-    a.ruleColor === b.ruleColor && a.ruleWidth === b.ruleWidth &&
-    a.frame === b.frame &&
-    num(a.gap, 8) === num(b.gap, 8) &&
-    num(a.rowGap, 34) === num(b.rowGap, 34) &&
-    num(a.pad, 34) === num(b.pad, 34) &&
-    (a.mask || '关') === (b.mask || '关') &&
-    !!a.brushOn === !!b.brushOn &&
-    (a.borrow || 'off') === (b.borrow || 'off') &&
-    JSON.stringify(a.borrowBooks || null) === JSON.stringify(b.borrowBooks || null);
+/* ---------- 配置字段表：一处定义，三处用 ----------
+   ⚠️ 这张表是**唯一**的字段清单，三个地方都从它来：
+     ① cfgDiff() 算"这次改了什么"，给应用回执列条目；
+     ② cfgEqual() 判"还有没有没应用的改动"——它现在直接问"diff 是不是空的"；
+     ③ verify_web.js 的护栏拿 Object.keys(state) 逐条核对，少一条就红。
+   这是 10-27 那条规矩的落实：**判同一件事的代码只准存在一处**。
+   以前 cfgEqual 是一串手写的 &&；现在加了配置项只改这张表，
+   回执和 dirty 判定会同时跟上，不会再出现"改了但回执没写、或者 dirty 判错"。 */
+var INK_NAME = { ink: '墨色', red: '朱砂', rub: '原图' };
+var MASK_NAME = { '关': '关', '田': '田字格', '米': '米字格', '九': '九宫格' };
+var BORROW_NAME = { off: '不借', fill: '补缺', mix: '混搭' };
+var FRAME_NAME = { '关': '关', '单边': '单边（细）', '文武': '文武（一粗一细）' };
+var RCOLOR_NAME = { red: '朱丝栏', ink: '乌丝栏' };
+
+function onOff(v) { return v ? '开' : '关'; }
+
+function bookLabel(code) {
+  var b = (window.DATA && window.DATA.books || {})[code];
+  return (b && b.name) || String(code);
 }
+
+function booksLabel(v) {
+  if (!v || !v.length) return '全部';
+  var out = [];
+  for (var i = 0; i < v.length; i++) out.push(bookLabel(v[i]));
+  return out.join('、');
+}
+
+var CFG_FIELDS = [
+  { key: 'book', label: '底本', fmt: bookLabel },
+  { key: 'layout', label: '排版', fmt: function (v) { return v === '对联' ? '对联（两列）' : '条幅（单列）'; } },
+  { key: 'ink', label: '字色', fmt: function (v) { return INK_NAME[v] || v; } },
+  { key: 'credit', label: '落款', fmt: onOff },
+  { key: 'seal', label: '印章', fmt: onOff },
+  { key: 'ruled', label: '成册界行', fmt: onOff },
+  { key: 'ruleDir', label: '界行方向', fmt: function (v) { return v === '横' ? '横排（成行）' : '竖排（成列）'; } },
+  { key: 'ruleColor', label: '界行颜色', fmt: function (v) { return RCOLOR_NAME[v] || v; } },
+  { key: 'ruleWidth', label: '界行粗细', fmt: function (v) { return v || '细'; } },
+  { key: 'frame', label: '版框', fmt: function (v) { return FRAME_NAME[v] || v; } },
+  { key: 'gap', label: '字距', fmt: function (v) { return num(v, 8) + ' px'; } },
+  { key: 'rowGap', label: '行距', fmt: function (v) { return num(v, 34) + ' px'; } },
+  { key: 'pad', label: '页边距', fmt: function (v) { return num(v, 34) + ' px'; } },
+  { key: 'mask', label: '遮罩', fmt: function (v) { return MASK_NAME[v] || v; } },
+  { key: 'brushOn', label: '朱笔', fmt: onOff },
+  { key: 'borrow', label: '借字', fmt: function (v) { return BORROW_NAME[v] || v; } },
+  { key: 'borrowBooks', label: '可借的碑', fmt: booksLabel }
+];
+
+// 比较口径也按字段来，别在别处另写一套
+var NUM_KEYS = { gap: 1, rowGap: 1, pad: 1 };
+var BOOL_KEYS = { credit: 1, seal: 1, ruled: 1, brushOn: 1 };
+
+function cfgFieldEqual(k, a, b) {
+  if (k === 'borrowBooks') return JSON.stringify(a || null) === JSON.stringify(b || null);
+  if (NUM_KEYS[k]) return num(a, 0) === num(b, 0);
+  if (BOOL_KEYS[k]) return !!a === !!b;
+  return String(a == null ? '' : a) === String(b == null ? '' : b);
+}
+
+/* 返回 [{ key, label, from, to, rawFrom, rawTo }]，只列真变了的那些 */
+function cfgDiff(a, b) {
+  var out = [];
+  for (var i = 0; i < CFG_FIELDS.length; i++) {
+    var f = CFG_FIELDS[i];
+    var va = a ? a[f.key] : undefined;
+    var vb = b ? b[f.key] : undefined;
+    if (cfgFieldEqual(f.key, va, vb)) continue;
+    out.push({
+      key: f.key, label: f.label,
+      from: f.fmt(va), to: f.fmt(vb),
+      rawFrom: va, rawTo: vb
+    });
+  }
+  return out;
+}
+
+/* ⚠️ 相等 = diff 为空。只有这一处判定，别再写成第二串手写的 && ——
+   10-27 那次"改判定只改了一处、漏了另一处"就是那么栽的。 */
+function cfgEqual(a, b) { return cfgDiff(a, b).length === 0; }
+
 
 function isDirty() {
   return !!draft && !cfgEqual(draft, state);
 }
 
+/* ---------- 应用回执（toast） ----------
+   位置由 CSS 管（底部居中、fixed、不进文档流）。
+   这里只管内容：标题 + 本次改了什么 + 一句补充 + 一个【撤销】。 */
+var toastTimer = null;
+
+function showToast(title, items, opts) {
+  opts = opts || {};
+  var box = el('toast');
+  if (!box) return;
+  items = items || [];
+
+  el('toastTitle').textContent = title;
+
+  var list = el('toastList');
+  while (list.firstChild) list.removeChild(list.firstChild);
+  for (var i = 0; i < items.length; i++) {
+    var li = document.createElement('li');
+    li.appendChild(document.createTextNode(items[i].label + '：'));
+    var from = document.createElement('i');
+    from.textContent = items[i].from;
+    li.appendChild(from);
+    li.appendChild(document.createTextNode(' → '));
+    var to = document.createElement('b');
+    to.textContent = items[i].to;
+    li.appendChild(to);
+    list.appendChild(li);
+  }
+  list.hidden = !items.length;
+
+  var note = el('toastNote');
+  note.textContent = opts.note || '';
+  note.hidden = !opts.note;
+
+  el('toastUndo').hidden = !opts.undo;
+
+  clearTimeout(toastTimer);
+  box.classList.add('on');
+  toastTimer = setTimeout(function () { box.classList.remove('on'); }, opts.hold || 4600);
+}
+
+function hideToast() {
+  clearTimeout(toastTimer);
+  var box = el('toast');
+  if (box) box.classList.remove('on');
+}
+
+/* ---------- 开屏横幅 ----------
+   每次打开都露一条，4.6 秒自己滑走，点了【知道了】立刻收。
+   故意不记 localStorage：白星要的是"保险一点"——宁可每次都说一遍，
+   也别让某个人在不知情的时候丢掉半天标出来的东西。
+   ⚠️ 它是 fixed 的（见 style.css 的说明）：一旦进文档流，整页会被推一下，
+      .paper 的 ResizeObserver 就会当成纸张变了而重画版框，画面会抖。 */
+var noticeTimer = null;
+
+function showNotice() {
+  var bar = el('noticeBar');
+  if (!bar) return;
+  bar.classList.add('on');
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(function () { bar.classList.remove('on'); }, 4600);
+}
+
+/* ---------- 撤销：只回退"设置"，不动朱笔和手挑的写法 ----------
+   为什么只管设置：朱笔是用户一个字一个字点出来的手工活儿，
+   不该被"撤销样式"这个动作一起带走——他要撤的是"样式改错了"，不是"我今天白标了"。
+   为什么换句就清栈：句子一变，撤销回去等于把上一句的设置套在新句子上，
+   用户看到的是"点了撤销却没变化"——宁可不给，也别给一个骗人的撤销。 */
+var undoStack = [];
+var UNDO_MAX = 20;      // 一条快照 1~11 KB（看句子长度），20 条撑死两百来 KB，可以忽略
+
+function pushUndo(cfg) {
+  undoStack.push(cloneCfg(cfg));
+  while (undoStack.length > UNDO_MAX) undoStack.shift();   // 先进先出，最老的静默丢弃
+  updateUndoBtn();
+}
+
+function clearUndo() {
+  undoStack.length = 0;
+  updateUndoBtn();
+}
+
+function updateUndoBtn() {
+  var b = el('btnUndo');
+  if (b) b.disabled = !undoStack.length;
+}
+
+function undoApply() {
+  if (!undoStack.length) return;
+  var back = undoStack.pop();
+  var wasBook = state.book;
+  state = cloneCfg(back);
+  if (state.book !== wasBook) closeVersions();   // 换碑后版本列表全变了
+  applyInkToPage(state.ink);
+  if (draft) draft = cloneCfg(state);            // 面板跟着回去，别留一个已作废的值
+  render();
+  syncPanel();
+  renderPreview();
+  markDirty();
+  updateUndoBtn();
+  hideToast();
+  showToast('已撤销上一次改动', [], { hold: 2200 });
+}
+
+
 function applyDraft() {
   if (!draft) return;
+  var changes = cfgDiff(state, draft);
+  if (!changes.length) { markDirty(); return; }   // 没改就不动，也不白占一条撤销栈
   var wasBook = state.book;
+  pushUndo(state);                 // ⚠️ 必须在 state 被覆盖之前存下来
   state = cloneCfg(draft);
   if (state.book !== wasBook) closeVersions();   // 换碑后版本列表全变了
   applyInkToPage(state.ink);
   render();
   markDirty();
+  updateUndoBtn();
+
+  /* 换碑的坑：朱笔的键是「碑:字#第几次」，换了碑就匹配不上——
+     数据没丢（换回原碑还能看见），但当前画面上一支都不显示。
+     这一句必须说出来，不然用户会以为朱笔被吃掉了。 */
+  var note = '';
+  if (state.book !== wasBook) {
+    var lost = brushCount(wasBook);
+    if (lost) note = '换了底本：之前标的 ' + lost + ' 个朱笔在这一块碑上不显示，换回原碑还能看见。';
+  }
+  showToast('已应用 ' + changes.length + ' 项改动', changes, { undo: true, note: note });
 }
 
 function cancelDraft() {
@@ -2175,8 +2371,12 @@ function init() {
   refreshInput();
 
   el('input').addEventListener('input', function () {
+    /* ⚠️ 改一个字就会走 resetPicks()，把朱笔和手挑的写法一起清掉。
+       数量要在清之前数——清完再数永远是 0，提示就成了摆设。 */
+    var lost = brushCount(state.book);
     closeVersions();   // 改了内容，版本区里的字可能已经不在句里了
     resetPicks();      // 换了句子：上一句挑的写法不作数，回到自动避复
+    if (lost) showToast('改句子了：' + lost + ' 个朱笔标注已清空', [], { hold: 3600 });
     refreshInput();
     scheduleRender();
   });
@@ -2268,12 +2468,36 @@ function init() {
     markDirty();
   });
 
-  // 【全部取消】把这一句标过的朱笔一次清掉
+  /* 【全部取消】两段式确认。
+     为什么不弹模态：清空确实不可撤销，但模态弹窗会被当成"又一个要点掉的框"，
+     点习惯了照样闭眼确认。把**数量**直接写到按钮上（"确认清空 5 个？"），
+     比一句干巴巴的"你确定吗"有用得多——他一看就知道要失去什么。 */
+  var clearArm = false, clearArmTimer = null;
+  function disarmClear() {
+    clearArm = false;
+    clearTimeout(clearArmTimer);
+    var b = el('btnBrushClear');
+    b.textContent = '全部取消';
+    b.classList.remove('danger');
+  }
+
   el('btnBrushClear').addEventListener('click', function () {
+    var n = brushCount(state.book);
+    if (!n) { showToast('这一句还没标任何字', [], { hold: 2200 }); return; }
+    if (!clearArm) {
+      clearArm = true;
+      var b = el('btnBrushClear');
+      b.textContent = '确认清空 ' + n + ' 个？';
+      b.classList.add('danger');
+      clearArmTimer = setTimeout(disarmClear, 4000);
+      return;
+    }
+    disarmClear();
     clearBrush();
     syncPanel();
     render();
     renderPreview();
+    showToast('已清空 ' + n + ' 个朱笔标注', [], { hold: 2600 });
   });
 
   ['segRuleDir:ruleDir', 'segRuleColor:ruleColor', 'segRuleWidth:ruleWidth',
@@ -2364,6 +2588,20 @@ function init() {
   });
 
   bindTooltip();
+
+  /* 撤销 / 应用回执 / 开屏横幅 的三个入口。
+     两处撤销按钮都是同一个 undoApply——行为只写一次，别分两份维护。 */
+  el('btnUndo').addEventListener('click', undoApply);
+  el('toastUndo').addEventListener('click', undoApply);
+  el('toastClose').addEventListener('click', hideToast);
+  updateUndoBtn();
+
+  el('noticeClose').addEventListener('click', function () {
+    clearTimeout(noticeTimer);
+    el('noticeBar').classList.remove('on');
+  });
+  showNotice();
+
   render();
 }
 

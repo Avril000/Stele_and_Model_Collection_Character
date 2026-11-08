@@ -1039,8 +1039,15 @@ try {
     check('面板里报出标了几个字',
       document.getElementById('brushTip').textContent.includes('已标 2 个字'));
 
-    document.getElementById('btnBrushClear').click();
-    check('【全部取消】一次清空', brushed().length === 0);
+    /* 【全部取消】改成了两段式：第一下只问、第二下才清。
+       为什么改：这一下清掉的是用户一个字一个字点出来的活儿，且撤销找不回来。 */
+    const clr = document.getElementById('btnBrushClear');
+    clr.click();
+    check('【全部取消】第一下只问，不真清', brushed().length === 2);
+    check('按钮当场报出要清几个（比"你确定吗"有用）',
+      clr.textContent.includes('2') && clr.textContent.includes('确认'));
+    clr.click();
+    check('第二下才真的清空', brushed().length === 0);
   } else {
     check('「之之」要排出两个字格才能验"逐字"', false);
   }
@@ -1241,6 +1248,93 @@ check('尺寸检查排在真正建画布之前（算完就查，不画了才发�
 check('实时渲染有防抖', /setTimeout\(flushPendingRender/.test(appJs));
 check('防抖要有 flush 出口（自检是同步的，等不了那 180ms）',
   /function flushPendingRender/.test(appJs));
+
+/* ========= 应用回执 / 撤销 / 开屏横幅（2026-11-08） ========= */
+
+/* 第一条就是护栏：字段表必须**覆盖 state 的每一个字段**。
+   以后加配置忘了登记，这条会红——回执漏报比不回执更伤人。
+   （同理也挡着"cfgEqual 和 cfgDiff 各写一套"：相等判定现在只从 diff 来。） */
+const stateKeys = Object.keys(window.state).sort();
+const fieldKeys = window.CFG_FIELDS.map(f => f.key).sort();
+check('配置字段表 = state 的字段全集（加新配置必须登记，否则回执会漏报）',
+  JSON.stringify(stateKeys) === JSON.stringify(fieldKeys));
+check('字段表是 17 条', window.CFG_FIELDS.length === 17);
+check('相等判定只有一处：cfgEqual 就是"diff 为空"',
+  /function cfgEqual\(a, b\) \{ return cfgDiff\(a, b\)\.length === 0; \}/.test(appJs));
+
+/* diff 本身 */
+const snapA = window.cloneCfg(window.state);
+const snapB = window.cloneCfg(window.state);
+snapB.borrow = 'fill';
+snapB.gap = 16;
+snapB.mask = '田';
+const df1 = window.cfgDiff(snapA, snapB);
+check('diff 只列真变了的项（3 项）', df1.length === 3);
+check('diff 说人话：借字 不借 → 补缺',
+  df1.some(x => x.label === '借字' && x.from === '不借' && x.to === '补缺'));
+check('diff 认得出数字：字距 → 16 px', df1.some(x => x.label === '字距' && x.to === '16 px'));
+check('没变化时 diff 是空的（dirty 判定也靠它）', window.cfgDiff(snapA, snapA).length === 0);
+
+/* 应用 → 回执 → 撤销 */
+window.clearUndo();
+window.brushSet = { 'dbt:上#0': 1 };          // 先手工放一个朱笔，验"撤销不动它"
+const brushBefore = window.brushCount('dbt');
+window.draft = window.cloneCfg(window.state);
+window.draft.borrow = 'fill';
+window.applyDraft();
+
+const tst = document.getElementById('toast');
+check('应用后弹出回执', tst.classList.contains('on'));
+check('回执标题报出改动项数', document.getElementById('toastTitle').textContent.includes('1 项'));
+check('回执逐条列「借字：不借 → 补缺」',
+  document.getElementById('toastList').textContent.includes('借字') &&
+  document.getElementById('toastList').textContent.includes('补缺'));
+check('回执带【撤销】按钮', document.getElementById('toastUndo').hidden === false);
+check('应用真的落到 state 上了', window.state.borrow === 'fill');
+check('栈里有东西了，抽屉里的撤销按钮不再是灰的',
+  window.undoStack.length === 1 && document.getElementById('btnUndo').disabled === false);
+
+document.getElementById('toastUndo').click();
+check('点【撤销这次】回到应用之前', window.state.borrow === 'off');
+check('撤销完栈空了、按钮变灰（没得撤就是没得撤，不骗人）',
+  window.undoStack.length === 0 && document.getElementById('btnUndo').disabled === true);
+check('撤销只回退设置，朱笔一个没动', window.brushCount('dbt') === brushBefore);
+
+/* 没改动就点应用：不该占一条栈 */
+window.applyDraft();
+check('没有改动时点应用，不白占撤销栈', window.undoStack.length === 0);
+
+/* 换句子 → 栈必须清空（不然撤销会回到"上一句话的设置"） */
+window.draft = window.cloneCfg(window.state);
+window.draft.ink = 'red';
+window.applyDraft();
+check('第二次应用入栈', window.undoStack.length === 1);
+inp.value = '道法自然';
+inp.dispatchEvent(new window.Event('input', { bubbles: true }));
+window.flushPendingRender();
+check('换了句子，撤销栈清空（句子变了，撤销回去就是骗人）', window.undoStack.length === 0);
+
+/* 换句时要是真清了朱笔，得说一声 */
+window.brushSet = { 'dbt:道#0': 1 };
+inp.value = '上善若水';
+inp.dispatchEvent(new window.Event('input', { bubbles: true }));
+window.flushPendingRender();
+check('换句清掉朱笔时，当场报数（丢了至少让人知道）',
+  /朱笔/.test(document.getElementById('toastTitle').textContent));
+
+/* 开屏横幅 */
+const nbar = document.getElementById('noticeBar');
+check('开屏横幅在，而且一打开就露出来', !!nbar && nbar.classList.contains('on'));
+check('横幅把两件会丢的事说全了（朱笔 / 手挑的写法）',
+  /朱笔/.test(nbar.textContent) && /手挑/.test(nbar.textContent));
+check('横幅是 fixed、不进文档流（进流会推整页，ResizeObserver 会重画版框）',
+  /\.noticebar \{[\s\S]*?position: fixed[\s\S]*?pointer-events: none/.test(css));
+check('回执也是 fixed（同理：不许挤动版面）',
+  /\.toast \{[\s\S]*?position: fixed/.test(css));
+
+/* 两处撤销按钮共用同一个处理函数——行为只写一份 */
+check('两处撤销入口共用一个 undoApply',
+  (appJs.match(/addEventListener\('click', undoApply\)/g) || []).length === 2);
 
 console.log('\n结果：' + pass + ' 通过，' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

@@ -8,6 +8,14 @@
 </head>
 <body data-page-node-id="g42c6vEauLNXxkxGmRFKpQ">
 
+<!-- 开屏横幅：每次打开都露一条，4 秒自己滑走，不拦任何操作。
+   ⚠️ 必须 position:fixed **不进文档流**——一进流整页就被往下推，
+      .paper 的 ResizeObserver 会当成"纸张尺寸变了"重画版框和界行，画面会抖一下。 -->
+<div class="noticebar" id="noticeBar" role="status">
+  <span class="nbtxt">改字或换碑会让整句重排：<b>朱笔标注</b>、<b>手挑的写法</b>会一起清空。调样式不受影响，随时能撤销。</span>
+  <button class="nbclose" id="noticeClose">知道了</button>
+</div>
+
 <header class="topbar" data-page-node-id="ZEiucWoKttqXVTKVbA5LQV">
   <div class="logo" data-page-node-id="zH87fqNtF1dRF7TKGhfFh7">碑帖集字生成器</div>
   <button class="ghost" id="btnHistory" data-page-node-id="iAsREY47fv35hivr58J6F5">历史集字</button>
@@ -348,9 +356,25 @@
     <button class="primary" id="btnApply">应用改动</button>
     <button class="ghost" id="btnCancel"
       data-tip="丢掉这次没应用的改动，回到打开面板时的样子。">放弃</button>
+    <button class="ghost" id="btnUndo" disabled
+      data-tip="回到上一次【应用改动】之前的样子。&#10;只回退样式设置，不动你标的朱笔和手挑的写法。&#10;换句、换碑之后这条记录就清空（记得最远 20 次）。">撤销上次</button>
     <span class="dfnote" id="dfnote"></span>
   </div>
 </aside>
+
+<!-- 应用回执：改了什么一条条列出来，并且当场给一个【撤销】。
+     放右下角、fixed，不占版面；4 秒自己走，也可以点掉。 -->
+<div class="toast" id="toast" role="status" aria-live="polite">
+  <div class="thead">
+    <strong id="toastTitle">已应用</strong>
+    <button class="tclose" id="toastClose" aria-label="关闭">×</button>
+  </div>
+  <ul class="tlist" id="toastList" hidden></ul>
+  <p class="tnote" id="toastNote" hidden></p>
+  <div class="tact">
+    <button class="tundo" id="toastUndo" hidden>撤销这次</button>
+  </div>
+</div>
 
 <script src="data.js"></script>
 <script src="app.js"></script>
