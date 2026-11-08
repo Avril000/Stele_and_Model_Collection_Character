@@ -15,8 +15,14 @@
     4. GitHub 才是正本，服务器只是副本
 
 用法（平时双击根目录的「一键_部署到服务器.bat」即可）：
-    python tools/deploy_server.py                 # 打包 + 上传 + 起服务 + 验证
+    python tools/deploy_server.py                 # 打包 + 上传 + （没在跑才起）+ 验证
     python tools/deploy_server.py --pack-only     # 只本地打包，不连服务器
+    python tools/deploy_server.py --restart       # 想强制重启服务时用（一般不需要）
+
+2026-11-08 的两条重要结论（改这段之前务必看代码里的注释）：
+    1）http.server 是静态服务，换了文件不用重启——所以脚本里不再出现 pkill；
+    2）pkill -f 匹配的是"整个命令行"，同一条 ssh 命令里只要还有一份
+       "http.server 端口"的字面量，括号技巧就挡不住，会把远端 shell 自己杀掉。
 """
 
 import argparse
@@ -87,6 +93,8 @@ def ssh_base(cfg):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pack-only", action="store_true", help="只本地打包，不连服务器")
+    ap.add_argument("--restart", action="store_true",
+                    help="要换端口/换目录时用：先停掉原来那个再起（平时用不到，静态服务不用重启）")
     args = ap.parse_args()
 
     print("=" * 56)
@@ -130,32 +138,53 @@ def main():
         print("     把窗口里的报错原文发我，我看一眼。")
         sys.exit(r.returncode)
 
-    print("\n—— 起静态服务（端口 %s）" % port)
+    print("\n—— 静态服务（端口 %s）" % port)
     print("  （还要再问一次密码，同一个）")
     sys.stdout.flush()
 
-    # ⚠️ 这里有两个坑，改之前先读：
-    # 1）pkill -f 'http.server 端口' 会把**自己**也杀掉——这条 ssh 命令的命令行里
-    #    就含这个字符串。写成 '[h]ttp.server' 是正则技巧：自身命令行是 "[h]ttp..."，
-    #    不含 "http..."，于是只杀真正的服务进程。（2026-10-24 白星第一次部署就栽在这）
-    # 2）别用 curl 在服务器上自检——curl 未必装了，一旦它返回非 0，
-    #    明明起来了也会被判断成失败。改成我在本地探测端口，以事实为准。
-    remote = (
-        f"mkdir -p ~/{remote_dir} && cd ~/{remote_dir} && "
-        f"PY=$(command -v python3 || command -v python) ; echo 解释器=$PY ; "
-        f"pkill -f '[h]ttp.server {port}' 2>/dev/null ; "
-        # 用「子 shell + 后台」启动：父 shell 不等它，stdout/stderr 全部落文件，
-        # ssh 一退出也不会把服务带走（比直接 nohup ... & 稳）
-        f"(nohup $PY -m http.server {port} --bind 0.0.0.0 "
-        f"> server.log 2>&1 < /dev/null &) ; "
-        f"sleep 3 ; "
-        f"echo '--- 进程 ---' ; ps -ef | grep '[h]ttp.server {port}' | head -3 ; "
-        f"echo '--- 日志 ---' ; tail -5 server.log 2>/dev/null"
-    )
-    r = subprocess.run(["ssh", *ssh_base(cfg), target, remote])
-    if r.returncode != 0:
-        print(f"\n（远程命令返回码 {r.returncode}（负数是被信号打断），"
-              f"先不慌——下面我自己探一下端口）")
+    # ⚠️ 这一段的血泪史，改之前先读：
+    # 1）2026-10-24：`pkill -f 'http.server 5721'` 会把**自己**杀掉——这条 ssh 命令的
+    #    命令行里就含这个字符串。
+    # 2）2026-11-08：换成 `pkill -f '[h]ttp.server 5721'` 也没救——方括号只挡住了自己
+    #    那一份，可**同一条命令的后面还写着 `nohup $PY -m http.server 5721`**，
+    #    那是字面量，正则照样匹配到远端 bash 自己的 argv（bash -c "……http.server 5721……"），
+    #    于是 shell 又被自己杀了（返回码 -1 / 4294967295，后面的 nohup 一次都没执行过）。
+    #    ⭐ 教训：pkill -f 匹配的是「整个命令行」，只要同一条命令里还有一份字面量，
+    #       括号技巧就白搭。
+    # 3）结论：**本脚本不再出现 pkill**。http.server 是静态服务，每次请求都从磁盘读文件，
+    #    换了文件根本不用重启——所以「已经在跑就别动它」才是正解（重启还会打断正在看的人）。
+    #    真要重启时加 --restart，那时才单独发一次 ssh，那条命令里只有 pkill，谁也杀不到。
+    if args.restart:
+        print("\n—— --restart：先停掉原来那个（单独一次 ssh，这条命令里只有 pkill）")
+        # 端口后面加数字边界，否则 5721 会把 57210 的邻居一起杀掉
+        kill_cmd = (f"pkill -f 'http[.]server {port}([^0-9]|$)' 2>/dev/null ; "
+                    f"sleep 1 ; echo 已清理")
+        subprocess.run(["ssh", *ssh_base(cfg), target, kill_cmd])
+
+    check_cmd = f"ss -lntp 2>/dev/null | grep -qE ':{port}([^0-9]|$)'"
+    r = subprocess.run(["ssh", *ssh_base(cfg), target, check_cmd])
+    running = r.returncode == 0
+
+    if running:
+        print("  服务器上已经在跑了 → 跳过启动（文件已换，刷新浏览器就是新版）")
+    else:
+        remote = (
+            f"mkdir -p ~/{remote_dir} && cd ~/{remote_dir} && "
+            f"PY=$(command -v python3 || command -v python) ; echo 解释器=$PY ; "
+            # 用「子 shell + 后台」启动：父 shell 不等它，stdout/stderr 全部落文件，
+            # ssh 一退出也不会把服务带走（比直接 nohup ... & 稳）
+            f"(nohup $PY -m http.server {port} --bind 0.0.0.0 "
+            f"> server.log 2>&1 < /dev/null &) ; "
+            f"sleep 3 ; "
+            f"echo '--- 监听 ---' ; "
+            f"ss -lntp 2>/dev/null | grep ':{port}' ; "
+            f"echo '--- 日志 ---' ; tail -5 server.log 2>/dev/null"
+        )
+        r = subprocess.run(["ssh", *ssh_base(cfg), target, remote])
+        if r.returncode != 0:
+            print(f"\n（远程命令返回码 {r.returncode}（负数是被信号打断），"
+                  f"先不慌——下面我自己探一下端口）")
+
 
     # 成败以「外面真的能打开」为准，不看远程命令的脸色
     print("\n—— 验证（本地探测，最多等 12 秒）")
@@ -175,12 +204,12 @@ def main():
         print(f" 部署完成 → {url}")
         print(" 打开看看能不能用；能用就发给组员一起玩。")
     else:
-        print(" 文件传上去了，但端口还没起来。可能的原因：")
-        print("   ① 服主还没在腾讯云防火墙放行这个端口（最常见）")
-        print("   ② 服务器上没装 python3 / python")
-        print("   ③ 端口被别人占了")
-        print(" 把上面「解释器=」那一行发我，我一眼能看出是哪个。")
-        print(" 另外可以直接问服主一句：5721 放行了吗？")
+        # 判断卡在哪一步——「服务有没有在听」和「外面通不通」是两件事，不能混着猜
+        print(" 文件传上去了，但端口还没起来。分两种查（看上面「--- 监听 ---」那一段）：")
+        print("   · 服务器上根本没在听 → 多半是解释器或目录问题，把「日志」两行发我")
+        print("   · 服务器上在听、外面不通 → 那才是防火墙（把监听那一行发给服主，他好查安全组）")
+        print(" 另外：python3 确认存在（「解释器=」那行不为空），所以别再怀疑它了。")
+        print(f" 一句话问服主：{port} 在安全组里放行了吗？")
     print(" 提醒：汇报当天提前 30 分钟再确认一次（进程可能半夜挂掉）。")
     print(" 主轨别忘了：本地双击 web/index.html 才是保命的那一版。")
     print("=" * 56)
